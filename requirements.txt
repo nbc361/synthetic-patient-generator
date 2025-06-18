@@ -4,7 +4,7 @@ langchain
 chromadb
 pandas
 scipy
-icd10data      # ICD lookup library
+icd10
 PyPDF2         # PDF text extraction
 python-docx    # Word file extraction
 jinja2         # (for future HTML bias report)
