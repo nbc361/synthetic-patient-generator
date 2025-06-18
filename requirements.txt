@@ -9,3 +9,4 @@ PyPDF2         # PDF text extraction
 python-docx    # Word file extraction
 jinja2         # (for future HTML bias report)
 plotly         # (for future bias visualization)
+requests
