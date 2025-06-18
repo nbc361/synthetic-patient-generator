@@ -4,9 +4,8 @@ langchain
 chromadb
 pandas
 scipy
-icd10
-PyPDF2         # PDF text extraction
-python-docx    # Word file extraction
-jinja2         # (for future HTML bias report)
-plotly         # (for future bias visualization)
+PyPDF2
+python-docx
 requests
+tqdm                # progress bars for later steps
+pydantic<3          # langchain needs v1 or v2, pin below v3
