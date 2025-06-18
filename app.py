@@ -1,7 +1,7 @@
 # app.py  ────────────── Streamlit front-end (UI only)
 
 import streamlit as st
-from icd10data import icd10
+import icd10
 from backend.pipeline import generate_cohort      # <- we’ll create this soon
 
 st.set_page_config(page_title="Patient Cohort Generator", layout="centered")
