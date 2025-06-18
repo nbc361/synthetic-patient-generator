@@ -1,7 +1,7 @@
 # app.py  ────────────── Streamlit front-end (UI only)
 
 import streamlit as st
-import icd10
+import requests
 from backend.pipeline import generate_cohort      # <- we’ll create this soon
 
 st.set_page_config(page_title="Patient Cohort Generator", layout="centered")
@@ -10,13 +10,25 @@ st.title("Patient Cohort Generator")
 # ── ICD-10 code ────────────────────────────────────────────────────────────
 code = st.text_input("ICD-10 code (e.g. J47, L73.2, K50)")
 diagnosis = ""
-if code:
-    try:
-        diagnosis = icd10.find(code.upper()).description
-        st.success(f"Diagnosis: **{diagnosis}**")
-    except (KeyError, AttributeError):
-        st.error("ICD-10 code not found.")
 
+if code:
+    url = "https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search"
+    params = {
+        "sf": "code,desc",   # return code + description
+        "df": "desc",        # search in description field too
+        "terms": code.upper()
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=5)
+        data = resp.json()   # [list-length, [codes], [descs], ...]
+        if data[0] > 0 and data[1][0].upper() == code.upper():
+            diagnosis = data[2][0]          # first matching description
+            st.success(f"Diagnosis: **{diagnosis}**")
+        else:
+            st.error("ICD-10 code not found.")
+    except Exception as e:
+        st.error(f"Lookup error: {e}")
+        
 # ── Upload docs + comments ────────────────────────────────────────────────
 files = st.file_uploader("Upload PDFs / DOCX / TXT", accept_multiple_files=True,
                          type=["pdf", "docx", "txt"])
