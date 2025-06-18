@@ -2,7 +2,6 @@ streamlit==1.34
 openai>=1.30
 langchain
 chromadb
-synthea-py==0.4
 pandas
 scipy
 icd10cm        # ICD lookup library
