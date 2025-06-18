@@ -1,7 +1,7 @@
 # app.py  ────────────── Streamlit front-end (UI only)
 
 import streamlit as st
-from icd10cm import search
+from icd10data import icd10
 from backend.pipeline import generate_cohort      # <- we’ll create this soon
 
 st.set_page_config(page_title="Patient Cohort Generator", layout="centered")
@@ -11,11 +11,10 @@ st.title("Patient Cohort Generator")
 code = st.text_input("ICD-10 code (e.g. J47, L73.2, K50)")
 diagnosis = ""
 if code:
-    hit = search(code.upper())
-    if hit:
-        diagnosis = hit[0].description
+    try:
+        diagnosis = icd10.find(code.upper()).description
         st.success(f"Diagnosis: **{diagnosis}**")
-    else:
+    except (KeyError, AttributeError):
         st.error("ICD-10 code not found.")
 
 # ── Upload docs + comments ────────────────────────────────────────────────
