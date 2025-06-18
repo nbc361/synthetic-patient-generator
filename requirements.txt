@@ -5,3 +5,8 @@ chromadb
 synthea-py==0.4
 pandas
 scipy
+icd10cm        # ICD lookup library
+PyPDF2         # PDF text extraction
+python-docx    # Word file extraction
+jinja2         # (for future HTML bias report)
+plotly         # (for future bias visualization)
