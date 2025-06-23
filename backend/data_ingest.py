@@ -1,67 +1,60 @@
+# backend/ingest.py
 """
-backend/ingest.py
-Turns uploaded PDFs, DOCX, or TXT files into
-1 500-character text chunks, and attaches the user’s
-per-file “scope note” comment to every chunk.
+Turn user-supplied documents into a Chroma vector-store we can query later.
 """
-
+from __future__ import annotations
 from pathlib import Path
-from typing import List, Tuple
-import re
+from typing import Iterable
 
-import PyPDF2
-import docx  # from python-docx
+from langchain.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain.text_splitter   import RecursiveCharacterTextSplitter
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores     import Chroma
 
-# ─────────────────────────────────────────────────────────
-# helper – split long text into ~1 500-char overlapping chunks
-# ─────────────────────────────────────────────────────────
-def _split_text(text: str, size: int = 1500, overlap: int = 100) -> List[str]:
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap  # small overlap so sentences don’t break
-    return chunks
+from backend.openai_utils import MODEL          # re-use model family
+# ---------------------------------------------------------------------------
 
+_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size   = 1_000,
+    chunk_overlap= 200,
+    separators   = ["\n\n", "\n", " ", ""],
+)
 
-# ─────────────────────────────────────────────────────────
-# main entry
-# files  : list of Streamlit UploadedFile
-# notes  : list of strings (one per file, already validated)
-# returns: list[Tuple[str, str]]  -> (chunk_text, scope_note)
-# ─────────────────────────────────────────────────────────
-def chunk_docs(files, notes: List[str]) -> List[Tuple[str, str]]:
-    out_chunks = []
+_EMBEDDER = OpenAIEmbeddings(model=MODEL)
 
-    for file_obj, note in zip(files, notes):
-        suffix = Path(file_obj.name).suffix.lower()
+def _load(path: Path):
+    """Return a LangChain Document list for a single file."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return PyPDFLoader(str(path)).load()
+    if suffix in {".docx", ".doc"}:
+        return Docx2txtLoader(str(path)).load()
+    if suffix == ".txt":
+        return TextLoader(str(path), encoding="utf-8").load()
+    raise ValueError(f"Unsupported file type: {suffix}")
 
-        # --- read raw full text from each file type -----------------------
-        if suffix == ".pdf":
-            reader = PyPDF2.PdfReader(file_obj)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+def ingest(files: Iterable, scope_notes: list[str]) -> Chroma:
+    """
+    • `files` – list of `UploadedFile` objects from Streamlit  
+    • `scope_notes` – list of one-line descriptions the user typed
 
-        elif suffix == ".docx":
-            doc = docx.Document(file_obj)
-            text = "\n".join(p.text for p in doc.paragraphs)
+    Returns an **in-memory Chroma** index you can immediately `.sim_search()`.
+    """
+    all_docs = []
+    for up, note in zip(files, scope_notes):
+        # Streamlit’s UploadedFile -> temp file on disk
+        tmp_path = Path(up.name)
+        with tmp_path.open("wb") as f:
+            f.write(up.read())
 
-        elif suffix == ".txt":
-            text = file_obj.read().decode("utf-8", errors="ignore")
+        docs = _load(tmp_path)
+        for d in docs:
+            d.metadata.setdefault("scope_note", note)
+            d.metadata.setdefault("source_file", up.name)
+        all_docs.extend(docs)
+        tmp_path.unlink(missing_ok=True)  # tidy up
 
-        else:
-            # should never happen (we limited types in uploader)
-            text = ""
-
-        # tidy whitespace
-        text = re.sub(r"\s+\n", "\n", text)        # rm long spaces before linebreak
-        text = re.sub(r"\n\s+", "\n", text)        # rm indents
-        text = re.sub(r"\n{3,}", "\n\n", text)     # squash >2 blank lines
-
-        # --- split into chunks and attach scope note ----------------------
-        for chunk in _split_text(text):
-            if chunk.strip():                      # skip empty
-                out_chunks.append((chunk, note.strip()))
-
-    return out_chunks
+    # ---- split & embed
+    chunks = _SPLITTER.split_documents(all_docs)
+    vectordb = Chroma.from_documents(chunks, _EMBEDDER)  # in-memory
+    return vectordb
