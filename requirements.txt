@@ -1,11 +1,13 @@
 streamlit==1.34
 openai>=1.30
-langchain
-chromadb
+langchain==0.3.25
+chromadb==1.0.12
+tiktoken>=0.6       # token counting
+pydantic>=2.7       # schema validation
+python-dotenv>=1.0  # load .env in CLI runs
 pandas
+numpy
 scipy
-PyPDF2
-python-docx
-requests
-tqdm                # progress bars for later steps
-pydantic<3          # langchain needs v1 or v2, pin below v3
+faker              # extra realism for addresses, phones, etc.
+aequitas           # bias / fairness metrics
+pytest             # tests
