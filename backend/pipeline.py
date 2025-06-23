@@ -1,39 +1,46 @@
 # backend/pipeline.py
+"""End-to-end cohort generator."""
+
 from pathlib import Path
-import tempfile, zipfile, csv, json, textwrap
 from datetime import datetime
+import tempfile, zipfile, csv, json, textwrap, random
 
-# ---- OpenAI helper (reads key from st.secrets) ---------------------------
-from backend.openai_utils import chat, MAX_PATIENTS
+# ── local helpers ---------------------------------------------------------
+from backend.openai_utils  import chat, MAX_PATIENTS          # OpenAI wrapper
+from backend.data_ingest   import ingest                      # your new ingester
 
-# -------------------------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────────
 def generate_cohort(
-    icd_code: str,
-    icd_label: str,
-    files,                    # list of UploadedFile objects from Streamlit
-    comments: str,            # "\n"-separated scope notes
-    n: int,
-    demo_filters: dict,
-    seed: str | None = None,
-    benchmark=None,
+    icd_code:      str,
+    icd_label:     str,
+    files,                       # list[UploadedFile] from Streamlit
+    comments:      str,          # “\n”-separated scope notes
+    n:             int,
+    demo_filters:  dict,
+    seed:          str | None = None,
+    benchmark                   = None,
 ):
     """
-    Return a ZIP path + run-id for a synthetic-patient cohort.
+    Build a synthetic-patient CSV + ZIP and return (zip_path, run_id).
 
-    • Uses OpenAI to create the patient rows.
-    • Keeps everything in a temp dir so Streamlit can stream the ZIP out.
+    • Indexes any uploaded PDFs/DOC/DOCX/TXT into an in-memory Chroma DB
+    • Pulls the most relevant passages to seed the LLM
+    • Prompts GPT-4o-mini (or whatever model is set in secrets.toml)
+    • Validates / writes CSV, returns a ready-to-download ZIP
     """
-
-    # ---------------------------- guard-rails -----------------------------
-    if n > MAX_PATIENTS:               # defined in .streamlit/secrets.toml
-        raise ValueError(f"n ({n}) exceeds MAX_PATIENTS={MAX_PATIENTS}")
-    if not icd_code or not icd_label:
+    # ------------------------ guard-rails ---------------------------------
+    if n > MAX_PATIENTS:
+        raise ValueError(f"n={n} exceeds MAX_PATIENTS={MAX_PATIENTS}")
+    if not (icd_code and icd_label):
         raise ValueError("ICD-10 code/label missing")
 
-    # ----------------------  build the LLM prompt  -----------------------
+    if seed:
+        random.seed(seed)
+
+    # ------------------------ build prompt pieces -------------------------
     prompt_parts = [
-        f"You are a clinical data engine that fabricates HIGH-QUALITY "
-        f"synthetic patients strictly for software testing and demo.",
+        "You are a clinical data engine that fabricates HIGH-QUALITY "
+        "synthetic patients strictly for software testing and demo purposes.",
         "",
         f"Diagnosis to model: **{icd_label}** (ICD-10 {icd_code}).",
         f"Number of patients requested: **{n}**.",
@@ -47,61 +54,61 @@ def generate_cohort(
         if readable:
             prompt_parts.append(f"Apply these demographic constraints: {readable}")
 
-    # scope notes + VERY short snippets of uploaded docs -------------------
-    if files:
-        notes = [ln.strip() for ln in comments.splitlines()]
-        doc_blurbs = []
-        for idx, file in enumerate(files):
-            label = notes[idx] if idx < len(notes) else file.name
-            # read at most first ~2k chars – just enough for context
-            snippet = file.read(2048).decode(errors="ignore")
-            file.seek(0)
-            doc_blurbs.append(
-                f"\n### {label}\n{snippet}\n"
-            )
-        prompt_parts.append(
-            "The following reference material MAY inform comorbidities, meds, "
-            "or lab patterns – do not copy text verbatim:\n"
-            + "\n".join(doc_blurbs)
+    # ingest documents → Chroma -------------------------------------------
+    notes      = [ln.strip() for ln in comments.splitlines()]
+    vectordb   = ingest(files, notes) if files else None
+
+    # pull top passages ----------------------------------------------------
+    if vectordb:
+        query    = f"{icd_label} clinical features comorbidities treatment"
+        top_docs = vectordb.similarity_search(query, k=6)
+        contexts = "\n---\n".join(
+            d.page_content.strip()[:1_400] for d in top_docs
         )
 
-    # instruct JSON return format -----------------------------------------
+        prompt_parts.append(
+            "Use the following reference snippets ONLY for clinical realism. "
+            "Never copy text verbatim:\n" + contexts
+        )
+
+    # require strict JSON output ------------------------------------------
     prompt_parts.append(
         textwrap.dedent(
             """
-            Respond ONLY with valid JSON – an array of objects.  
+            Respond ONLY with valid JSON – an array of objects.
             Each object must contain:
 
-            - patient_id          (string, unique)  
-            - age                 (integer)  
-            - sex                 ("F" or "M")  
-            - race                (US CDC wide-band)  
-            - ethnicity           ("Hispanic or Latino" / "Not Hispanic or Latino")  
-            - icd10_code          (string)  
-            - diagnosis           (string)
+            - patient_id   (string, unique)
+            - age          (integer)
+            - sex          ("F" or "M")
+            - race         (US CDC wide-band)
+            - ethnicity    ("Hispanic or Latino" / "Not Hispanic or Latino")
+            - icd10_code   (string)
+            - diagnosis    (string)
 
             Return NO markdown fences, NO commentary – pure JSON.
             """
         )
     )
 
-    system_msg = {"role": "system", "content": "You are a careful medical data generator."}
-    user_msg   = {"role": "user",   "content": "\n".join(prompt_parts)}
+    system_msg = {"role": "system",
+                  "content": "You are a careful medical data generator."}
+    user_msg   = {"role": "user", "content": "\n".join(prompt_parts)}
 
-    # --------------------------- OpenAI call ------------------------------
-    response = chat([system_msg, user_msg])
-    raw_json = response.choices[0].message.content.strip()
+    # ------------------------ LLM call ------------------------------------
+    response  = chat([system_msg, user_msg])
+    raw_json  = response.choices[0].message.content.strip()
 
     try:
         patients = json.loads(raw_json)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"LLM returned invalid JSON: {e}") from None
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"LLM returned invalid JSON: {err}") from None
 
-    # --------------------------- CSV output -------------------------------
-    tmp_dir   = Path(tempfile.mkdtemp())
-    csv_path  = tmp_dir / "patients.csv"
-    headers   = ["patient_id", "age", "sex", "race", "ethnicity",
-                 "icd10_code", "diagnosis"]
+    # ------------------------ CSV output ----------------------------------
+    tmp_dir  = Path(tempfile.mkdtemp())
+    csv_path = tmp_dir / "patients.csv"
+    headers  = ["patient_id", "age", "sex", "race", "ethnicity",
+                "icd10_code", "diagnosis"]
 
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -109,10 +116,11 @@ def generate_cohort(
         for row in patients:
             writer.writerow(row)
 
-    # ----------------------------- ZIP it ---------------------------------
+    # ------------------------ ZIP bundle ----------------------------------
     zip_path = tmp_dir / "cohort.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(csv_path, csv_path.name)
 
     run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     return zip_path, run_id
+
