@@ -1,76 +1,88 @@
-# backend/data_ingest.py
 """
-Very small helper: turn a list[UploadedFile] from Streamlit
-into a Chroma VectorStore we can query with similarity_search().
+backend/data_ingest.py
+─────────────────────────────────────────────────────────────────────────
+Lightweight helper that takes Streamlit-uploaded files (PDF / DOCX / TXT)
+and returns a (filename, snippet) list that downstream code can pass to an
+LLM prompt or a vector-store.
+
+The file is fully self-contained and resilient to the LangChain package-split
+(works whether you have `langchain-community` installed or the older monolith).
 """
 
 from pathlib import Path
 import tempfile, shutil, os
+from typing import List, Tuple
 
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-    Docx2txtLoader,
-)
-from langchain_openai import OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter   # <- stays the same
-
-# one global embedding model (uses OPENAI_API_KEY from env / st.secrets)
-_EMBED = OpenAIEmbeddings()
-
-# splitter keeps chunks ≤ 1 k tokens and ~15 % overlap for recall
-_SPLITTER = RecursiveCharacterTextSplitter(
-    chunk_size       = 1_000,
-    chunk_overlap    = 150,
-    length_function  = len,
-)
-
-def _tmp_copy(uploaded_file):
-    """Save Streamlit's in-memory file to a real path and return it."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}")
-    tmp.write(uploaded_file.read())
-    tmp.flush()
-    return Path(tmp.name)
-
-# ───────────────────────────────────────────────────────────────────────────
-def ingest(files, notes=None):
-    """
-    • files  – list[streamlit.runtime.uploaded_file_manager.UploadedFile]
-    • notes  – optional list[str] human labels (same order)
-
-    Returns an IN-MEMORY Chroma VectorStore.
-    """
-    docs = []
-
-    for idx, up in enumerate(files):
-        label = (notes[idx] if notes and idx < len(notes) else up.name).strip() or f"doc_{idx}"
-        local = _tmp_copy(up)
-
-        # choose loader based on file suffix
-        suffix = local.suffix.lower()
-        if suffix == ".pdf":
-            loader = PyPDFLoader(str(local))
-        elif suffix in (".docx", ".doc"):
-            loader = Docx2txtLoader(str(local))
-        else:
-            loader = TextLoader(str(local), autodetect_encoding=True)
-
-        for doc in loader.load_and_split(_SPLITTER):
-            # tack on the friendly label so we can interpret results later
-            doc.metadata.setdefault("source", label)
-            docs.append(doc)
-
-        # clean up the tmp file – Chroma only needs text & embeddings now
-        try: os.remove(local)
-        except OSError: pass
-
-    if not docs:
-        raise ValueError("No parsable content found in uploaded files.")
-
-    vectordb = Chroma.from_documents(
-        docs,
-        embedding=_EMBED,
-        collection_name="ephemeral-files",    # kept only for this request
-        persist_directory=None,               # -> in memory
+# ── 1.  Loader imports ──────────────────────────────────────────────────
+# Try the new split-out package first; fall back to the legacy path so the
+# app still boots if the wheel was not installed for some reason.
+try:
+    from langchain_community.document_loaders import (
+        PyPDFLoader,
+        TextLoader,
+        Docx2txtLoader,
     )
-    return vectordb
+except ModuleNotFoundError:  # pre-split LangChain (< 0.1.19)
+    from langchain.document_loaders import (
+        PyPDFLoader,
+        TextLoader,
+        Docx2txtLoader,
+    )
+
+
+MAX_CHARS = 4_000  # cap text so we don’t blow the token budget
+
+
+# ── 2.  Internal helpers ────────────────────────────────────────────────
+def _loader_for(ext: str):
+    """Return the appropriate LangChain loader class for a file extension."""
+    ext = ext.lower()
+    if ext == ".pdf":
+        return PyPDFLoader
+    if ext in {".txt", ".text"}:
+        return TextLoader
+    if ext in {".docx", ".doc"}:
+        return Docx2txtLoader
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+# ── 3.  Public API  ─────────────────────────────────────────────────────
+def ingest(uploaded_files) -> List[Tuple[str, str]]:
+    """
+    Parameters
+    ----------
+    uploaded_files : list[streamlit.UploadedFile]
+        The list returned by `st.file_uploader(..., accept_multiple_files=True)`
+
+    Returns
+    -------
+    list[(filename, snippet)]
+        Each snippet is at most MAX_CHARS characters (≈1k tokens) – just
+        enough context for an LLM prompt or quick vector-embed.
+    """
+    results: List[Tuple[str, str]] = []
+
+    # Work in a temp folder so loaders can open real file paths
+    workdir = Path(tempfile.mkdtemp())
+
+    try:
+        for up in uploaded_files:
+            ext = Path(up.name).suffix
+            tmp_path = workdir / up.name
+
+            # Persist upload to disk
+            with tmp_path.open("wb") as f:
+                f.write(up.getbuffer())
+
+            # Load & concatenate pages / paragraphs
+            loader_cls = _loader_for(ext)
+            docs = loader_cls(str(tmp_path)).load()
+            full_text = "\n".join(d.page_content for d in docs)
+
+            results.append((up.name, full_text[:MAX_CHARS]))
+
+    finally:
+        # Always clean up – ignore errors if the dir is already gone
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    return results
