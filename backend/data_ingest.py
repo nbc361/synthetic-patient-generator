@@ -1,60 +1,77 @@
-# backend/ingest.py
+# backend/data_ingest.py
 """
-Turn user-supplied documents into a Chroma vector-store we can query later.
+Very small helper: turn a list[UploadedFile] from Streamlit
+into a Chroma VectorStore we can query with similarity_search().
 """
-from __future__ import annotations
+
 from pathlib import Path
-from typing import Iterable
+import tempfile, shutil, os
 
-from langchain.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
-from langchain.text_splitter   import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores     import Chroma
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    Docx2txtLoader,
+)
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-from backend.openai_utils import MODEL          # re-use model family
-# ---------------------------------------------------------------------------
+# one global embedding model (uses OPENAI_API_KEY from env / st.secrets)
+_EMBED = OpenAIEmbeddings()
 
+# splitter keeps chunks ≤ 1 k tokens and ~15 % overlap for recall
 _SPLITTER = RecursiveCharacterTextSplitter(
-    chunk_size   = 1_000,
-    chunk_overlap= 200,
-    separators   = ["\n\n", "\n", " ", ""],
+    chunk_size       = 1_000,
+    chunk_overlap    = 150,
+    length_function  = len,
 )
 
-_EMBEDDER = OpenAIEmbeddings(model=MODEL)
+def _tmp_copy(uploaded_file):
+    """Save Streamlit's in-memory file to a real path and return it."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}")
+    tmp.write(uploaded_file.read())
+    tmp.flush()
+    return Path(tmp.name)
 
-def _load(path: Path):
-    """Return a LangChain Document list for a single file."""
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return PyPDFLoader(str(path)).load()
-    if suffix in {".docx", ".doc"}:
-        return Docx2txtLoader(str(path)).load()
-    if suffix == ".txt":
-        return TextLoader(str(path), encoding="utf-8").load()
-    raise ValueError(f"Unsupported file type: {suffix}")
-
-def ingest(files: Iterable, scope_notes: list[str]) -> Chroma:
+# ───────────────────────────────────────────────────────────────────────────
+def ingest(files, notes=None):
     """
-    • `files` – list of `UploadedFile` objects from Streamlit  
-    • `scope_notes` – list of one-line descriptions the user typed
+    • files  – list[streamlit.runtime.uploaded_file_manager.UploadedFile]
+    • notes  – optional list[str] human labels (same order)
 
-    Returns an **in-memory Chroma** index you can immediately `.sim_search()`.
+    Returns an IN-MEMORY Chroma VectorStore.
     """
-    all_docs = []
-    for up, note in zip(files, scope_notes):
-        # Streamlit’s UploadedFile -> temp file on disk
-        tmp_path = Path(up.name)
-        with tmp_path.open("wb") as f:
-            f.write(up.read())
+    docs = []
 
-        docs = _load(tmp_path)
-        for d in docs:
-            d.metadata.setdefault("scope_note", note)
-            d.metadata.setdefault("source_file", up.name)
-        all_docs.extend(docs)
-        tmp_path.unlink(missing_ok=True)  # tidy up
+    for idx, up in enumerate(files):
+        label = (notes[idx] if notes and idx < len(notes) else up.name).strip() or f"doc_{idx}"
+        local = _tmp_copy(up)
 
-    # ---- split & embed
-    chunks = _SPLITTER.split_documents(all_docs)
-    vectordb = Chroma.from_documents(chunks, _EMBEDDER)  # in-memory
+        # choose loader based on file suffix
+        suffix = local.suffix.lower()
+        if suffix == ".pdf":
+            loader = PyPDFLoader(str(local))
+        elif suffix in (".docx", ".doc"):
+            loader = Docx2txtLoader(str(local))
+        else:
+            loader = TextLoader(str(local), autodetect_encoding=True)
+
+        for doc in loader.load_and_split(_SPLITTER):
+            # tack on the friendly label so we can interpret results later
+            doc.metadata.setdefault("source", label)
+            docs.append(doc)
+
+        # clean up the tmp file – Chroma only needs text & embeddings now
+        try: os.remove(local)
+        except OSError: pass
+
+    if not docs:
+        raise ValueError("No parsable content found in uploaded files.")
+
+    vectordb = Chroma.from_documents(
+        docs,
+        embedding=_EMBED,
+        collection_name="ephemeral-files",    # kept only for this request
+        persist_directory=None,               # -> in memory
+    )
     return vectordb
