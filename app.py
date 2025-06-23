@@ -7,46 +7,38 @@ from backend.pipeline import generate_cohort      # <- we’ll create this soon
 st.set_page_config(page_title="Patient Cohort Generator", layout="centered")
 st.title("Patient Cohort Generator")
 
-# ── ICD-10 code ────────────────────────────────────────────────────────────
+# ── ICD-10 lookup ──────────────────────────────────────────────────────────
 code = st.text_input("ICD-10 code (e.g. J47, L73.2, K50)")
 diagnosis = ""
 
 if code:
-    raw = code.strip().upper()          # normalise user input
+    raw = code.strip().upper()
     url = "https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search"
-    params = {
-        "sf": "code,desc",              # fields to return
-        "df": "desc",                   # search description, too
-        "terms": raw
-    }
+    params = {"sf": "code,desc", "df": "desc", "terms": raw}
 
     try:
-        resp = requests.get(url, params=params, timeout=5)
-        data = resp.json()              # ⇢ [count, [codes], [descs], …]
+        data = requests.get(url, params=params, timeout=5).json()  # [n, [codes], [descs]…]
 
-        # Sanity-check the payload
-        if not (isinstance(data, list) and len(data) >= 3):
-            st.error("Unexpected response from ICD-10 API.")
-            st.stop()
+        # sanity-check
+        if not (isinstance(data, list) and len(data) >= 3 and isinstance(data[1], list)):
+            st.error("Unexpected response from ICD-10 API."); st.stop()
 
         count, codes, descs = data[:3]
-        if count == 0:          # <-- add this
-            st.error("ICD-10 code not found.")
-            st.stop()
+        if count == 0:
+            st.error("ICD-10 code not found."); st.stop()
 
-
-        # find first match whose code *starts with* what the user typed
+        # first hit whose code *starts with* what the user typed
         match_idx = next(
-            (i for i, c in enumerate(codes) if c.upper().startswith(raw)),
+            (i for i, c in enumerate(codes) if c and c.upper().startswith(raw)),
             None
         )
 
-        if match_idx is not None:
-            full_code  = codes[match_idx]
-            diagnosis  = descs[match_idx]
-            st.success(f"Code resolved to **{full_code} — {diagnosis}**")
-        else:
-            st.error("ICD-10 code not found.")
+        if match_idx is None:
+            st.error("ICD-10 code not found."); st.stop()
+
+        full_code = codes[match_idx]
+        diagnosis = descs[match_idx]
+        st.success(f"Code resolved to **{full_code} — {diagnosis}**")
 
     except Exception as e:
         st.error(f"Lookup error: {e}")
