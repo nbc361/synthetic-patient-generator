@@ -11,3 +11,6 @@ scipy
 faker              # extra realism for addresses, phones, etc.
 aequitas           # bias / fairness metrics
 pytest             # tests
+pypdf            # for PyPDFLoader
+python-docx      # docx2txt’s backend
+docx2txt
