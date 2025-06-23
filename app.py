@@ -66,7 +66,12 @@ with st.expander("Optional extra patient attributes"):
         """
 **Define extra columns**
 
-* One line per column → `field_name : type`
+* One line per column → `field_name : type : unit`  
+* **type** = `int`, `float`, or `str`  
+* Anything after the 2nd “:” is stored as the **unit label** (optional)
+
+Example  
+`fev1_pct : float : %`  
 
 **Allowed types**
 
@@ -79,7 +84,7 @@ with st.expander("Optional extra patient attributes"):
 *(≈ 10 columns max is a good rule of thumb.)*
 
 **Example**
-fev1_pct : float ; sputum_volume_ml : int ; smoking_status : str
+fev1_pct : float : % ; sputum_volume_ml : int ; smoking_status : str
 """
     )
 
