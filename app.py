@@ -30,6 +30,10 @@ if code:
             st.stop()
 
         count, codes, descs = data[:3]
+        if count == 0:          # <-- add this
+            st.error("ICD-10 code not found.")
+            st.stop()
+
 
         # find first match whose code *starts with* what the user typed
         match_idx = next(
