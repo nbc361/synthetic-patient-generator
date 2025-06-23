@@ -145,11 +145,13 @@ def generate_cohort(
         if readable:
             prompt_parts.append(f"Apply these demographic constraints: {readable}")
 
-    if extra_cols:
-        prompt_parts.append(
-            "Additionally include these attributes:"
-            + ", ".join(f"{nm} ({tp})" for nm, tp, _ in extra_cols)
-        )
+  # -----------------------------------------------------------
+if extra_cols:
+    want = ", ".join(f"{nm} ({tp})" for nm, tp in extra_cols)
+    prompt_parts.append(
+        f"Additionally include these extra attributes on each patient: {want}"
+    )
+# -----------------------------------------------------------
 
     # ── context from reference documents --------------------------------
     notes    = [ln.strip() for ln in comments.splitlines()]
