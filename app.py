@@ -63,21 +63,38 @@ with st.expander("Optional demographic filters"):
 # ───────────────── extra dynamic column definitions ──────────────────────
 with st.expander("Optional extra patient attributes"):
     st.markdown(
-        "**Define extra columns**  \n"
-        "* One line per column → `field_name : type`  \n"
-        "* Allowed types → `int`, `float`, `str`  (max ≈10 columns)"
+        """
+**Define extra columns**
+
+* One line per column → `field_name : type`
+
+**Allowed types**
+
+| Type | What the model will generate | Example values |
+|------|------------------------------|----------------|
+| `int`   | whole numbers              | `0`, `3`, `42` |
+| `float` | decimal numbers            | `0.0`, `98.6`, `1.25` |
+| `str`   | free-text strings          | `"Yes"`, `"Ex-smoker"` |
+
+*(≈ 10 columns max is a good rule of thumb.)*
+
+**Example**
+fev1_pct : float
+sputum_volume_ml : int
+smoking_status : str
+"""
     )
-    st.code("fev1_pct : float\nsputum_volume_ml : int\nsmoking_status : str",
-            language="text")
 
     extra_schema_txt = st.text_area(
-        "Schema lines (edit or paste here)", height=140,
-        placeholder="fev1_pct : float"
+        "Schema lines",
+        height=160,
+        placeholder="fev1_pct : float",
     )
+
     if extra_schema_txt.strip():
         try:
             cols = _parse_extra_schema(extra_schema_txt)
-            st.success("✓ Detected columns " + ", ".join(n for n,_ in cols))
+            st.success("✓ Detected columns " + ", ".join(nm for nm, _ in cols))
         except Exception as e:
             st.error(f"⚠️ {e}")
 
