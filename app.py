@@ -110,7 +110,7 @@ exacerbations_last_year : int
     if extra_schema_txt.strip():
         try:
             cols = _parse_extra_schema(extra_schema_txt)
-            st.success("✓ Detected columns " + ", ".join(cols))
+            st.success("✓ Detected columns " + ", ".join(nm for nm, _ in cols))
         except Exception as e:
             st.error(f"⚠️ {e}")
 
