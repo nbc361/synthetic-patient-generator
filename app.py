@@ -14,31 +14,33 @@ diagnosis = ""
 if code:
     raw = code.strip().upper()
     url = "https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search"
-    params = {"sf": "code,desc", "df": "desc", "terms": raw}
+    params = {"sf": "code,name",       # search both columns
+              "df": "name",            # display only the name
+              "terms": raw,
+              "maxList": 50}           # (optional) widen result pool
 
     try:
-        data = requests.get(url, params=params, timeout=5).json()  # [n, [codes], [descs]…]
+        resp  = requests.get(url, params=params, timeout=5)
+        data  = resp.json()            # [count, [codes], null, [[name] …], …]
+        count = data[0]
+        codes = data[1]
+        names = data[3]                # <-- descriptions live here
 
-        # sanity-check
-        if not (isinstance(data, list) and len(data) >= 3 and isinstance(data[1], list)):
-            st.error("Unexpected response from ICD-10 API."); st.stop()
-
-        count, codes, descs = data[:3]
         if count == 0:
-            st.error("ICD-10 code not found."); st.stop()
+            st.error("ICD-10 code not found.")
+            st.stop()
 
-        # first hit whose code *starts with* what the user typed
-        match_idx = next(
-            (i for i, c in enumerate(codes) if c and c.upper().startswith(raw)),
-            None
-        )
+        # first result whose code starts with the user’s text
+        match_idx = next((i for i, c in enumerate(codes)
+                          if c.upper().startswith(raw)), None)
 
         if match_idx is None:
-            st.error("ICD-10 code not found."); st.stop()
+            st.error("ICD-10 code not found.")
+            st.stop()
 
         full_code = codes[match_idx]
-        diagnosis = descs[match_idx]
-        st.success(f"Code resolved to **{full_code} — {diagnosis}**")
+        diagnosis = names[match_idx][0]     # names[i] is a 1-element list
+        st.success(f"**{full_code} — {diagnosis}**")
 
     except Exception as e:
         st.error(f"Lookup error: {e}")
