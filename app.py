@@ -117,3 +117,4 @@ if st.button("Generate cohort", type="primary"):
         file_name = f"cohort_{run_id}.zip",
         mime  = "application/zip",
     )
+    
