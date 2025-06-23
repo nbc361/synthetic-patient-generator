@@ -1,7 +1,7 @@
 # backend/data_ingest.py
 """
-Save the Streamlit-uploaded docs to a temp dir, load them with
-LangChain loaders, then build an in-memory Chroma vector-DB.
+Turn Streamlit-uploaded docs into an in-memory FAISS VectorStore.
+FAISS has no server and works on Streamlit Cloud.
 """
 
 from __future__ import annotations
@@ -13,59 +13,46 @@ from langchain_community.document_loaders import (
     TextLoader,
     Docx2txtLoader,
 )
+from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings.openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
 
-# ---------------------------------------------------------------------
-def _to_temp_file(uploaded, out_dir: Path) -> Path:
-    """Persist a Streamlit UploadedFile to disk and return the path."""
-    out_path = out_dir / uploaded.name
-    with out_path.open("wb") as f:
+
+# ----------------------------------------------------------------------
+def _save_uploaded(uploaded, out_dir: Path) -> Path:
+    path = out_dir / uploaded.name
+    with path.open("wb") as f:
         f.write(uploaded.getbuffer())
-    return out_path
+    return path
 
 
 def ingest(files, comments: list[str]):
-    """
-    • `files`   → list[streamlit.UploadedFile]  
-    • `comments`→ list[str] (same length as files)
-
-    Returns a Chroma vector-store you can `.similarity_search()`.
-    """
-
+    """Return a FAISS vectorstore ready for `.similarity_search()`."""
     if not files:
-        raise ValueError("No files passed to ingest()")
+        raise ValueError("No files to ingest")
 
-    # temp workspace
-    tmp_root = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp())
     docs = []
 
-    for idx, up in enumerate(files):
-        note = comments[idx] if idx < len(comments) else up.name
-        path = _to_temp_file(up, tmp_root)
+    for i, up in enumerate(files):
+        note = comments[i] if i < len(comments) else up.name
+        p = _save_uploaded(up, tmp)
 
-        suffix = path.suffix.lower()
+        suffix = p.suffix.lower()
         if suffix == ".pdf":
-            loader = PyPDFLoader(str(path))
-        elif suffix in {".txt", ".text"}:
-            loader = TextLoader(str(path), encoding="utf-8")
+            loader = PyPDFLoader(str(p))
         elif suffix == ".docx":
-            loader = Docx2txtLoader(str(path))
+            loader = Docx2txtLoader(str(p))
+        elif suffix in {".txt", ".text"}:
+            loader = TextLoader(str(p), encoding="utf-8")
         else:
-            raise ValueError(f"Unsupported file type: {path.name}")
+            raise ValueError(f"Unsupported file type: {p.name}")
 
         for d in loader.load():
             d.metadata["source_note"] = note
             docs.append(d)
 
-    # build the mini vector-db (Ephemeral / in-memory)
-    embeddings = OpenAIEmbeddings()
-    vectordb = Chroma.from_documents(
-        docs,
-        embeddings,
-        persist_directory=None,   # purely in RAM
-    )
+    vectordb = FAISS.from_documents(docs, OpenAIEmbeddings())
 
-    # clean temp files when the process exits
-    shutil.rmtree(tmp_root, ignore_errors=True)
+    # tidy temp dir when process ends
+    shutil.rmtree(tmp, ignore_errors=True)
     return vectordb
