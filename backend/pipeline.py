@@ -1,28 +1,59 @@
 # backend/pipeline.py
-"""End-to-end synthetic-cohort generator."""
+"""End-to-end synthetic-cohort generator (dynamic extra columns supported)."""
 
 from __future__ import annotations
 
-# ── std-lib ────────────────────────────────────────────────────────────────
-from pathlib import Path
+# ── std-lib ───────────────────────────────────────────────────────────────
+import csv, json, os, random, tempfile, textwrap, zipfile
 from datetime import datetime
-import tempfile, zipfile, csv, json, textwrap, random, os
+from pathlib import Path
 
-# ── third-party ────────────────────────────────────────────────────────────
+# ── third-party ───────────────────────────────────────────────────────────
 from pydantic import BaseModel, ValidationError, field_validator
 
 # ── local helpers ─────────────────────────────────────────────────────────
-from backend.openai_utils import (
-    chat,           # thin wrapper around openai.chat.completions.create
-    MAX_PATIENTS,   # hard ceiling set in secrets.toml
-    MODEL,          # model name also from secrets.toml
-    TEMPERATURE,    # ditto
-)
-from backend.data_ingest import ingest            # PDF/DOC/TXT ⇒ Chroma
+from backend.openai_utils import chat, MAX_PATIENTS, MODEL, TEMPERATURE
+from backend.data_ingest  import ingest                       # PDF/DOC/TXT ⇒ Chroma
+
+# ════════════════════════════════════════════════════════════════════════
+# 0 ▪ small helper Streamlit calls to validate the “extra schema” box
+# ════════════════════════════════════════════════════════════════════════
+def _parse_extra_schema(text: str) -> list[tuple[str, str]]:
+    """
+    Convert the textarea lines into [(field, type), …].
+
+    • Expects “field_name : type” on each non-blank line
+    • Allowed types → int | float | str (case-insensitive)
+    • Raises ValueError on any problem
+    """
+    cols: list[tuple[str, str]] = []
+
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue                         # skip blank lines
+
+        if ":" not in ln:
+            raise ValueError(f"Missing ':' in line → {ln!r}")
+
+        name, typ = [p.strip() for p in ln.split(":", 1)]
+
+        if not name.isidentifier():
+            raise ValueError(f"Invalid field name → {name!r}")
+
+        typ = typ.lower()
+        if typ not in {"int", "float", "str"}:
+            raise ValueError(f"Type must be int / float / str → {typ!r}")
+
+        cols.append((name, typ))
+
+    if not cols:
+        raise ValueError("No columns recognised")
+
+    return cols                                # e.g. [("fev1_pct","float"), …]
 
 
 # ════════════════════════════════════════════════════════════════════════
-# 1 ▪ Pydantic schema  (tiny & fast – no heavy deps)
+# 1 ▪ Static (core) patient schema
 # ════════════════════════════════════════════════════════════════════════
 class PatientRow(BaseModel):
     patient_id : str
@@ -67,28 +98,29 @@ class PatientRow(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# 2 ▪ Public entry-point  (invoked by app.py)
+# 2 ▪ Public entry-point consumed by Streamlit front-end
 # ════════════════════════════════════════════════════════════════════════
 def generate_cohort(
+    *,
     icd_code:      str,
     icd_label:     str,
-    files,                       # list[streamlit.UploadedFile]
-    comments:      str,          # “\n”-separated scope notes
+    files,                          # list[streamlit.UploadedFile]
+    comments:      str,
     n:             int,
     demo_filters:  dict,
     seed:          str | None = None,
     benchmark                   = None,
+    extra_schema:   str          = "",   # << NEW
 ):
     """
     Returns (zip_path, run_id).
 
-    • Indexes any uploaded PDFs/DOC/DOCX/TXT into an in-memory Chroma DB
-    • Pulls the most relevant passages to seed GPT-4o-mini (or whatever
-      model is set in .streamlit/secrets.toml)
-    • Validates rows with Pydantic, writes CSV + run_meta.json inside a ZIP
+    • Index PDFs/DOCX/TXT ⇒ Chroma, pull top passages to seed the LLM
+    • Generates core columns + caller-defined extra columns (<=10)
+    • Validates rows with Pydantic, writes CSV + run_meta.json inside ZIP
     """
 
-    # ── guard-rails ────────────────────────────────────────────────────
+    # ── guard rails ------------------------------------------------------
     if n > MAX_PATIENTS:
         raise ValueError(f"n={n} exceeds MAX_PATIENTS={MAX_PATIENTS}")
     if not (icd_code and icd_label):
@@ -96,10 +128,17 @@ def generate_cohort(
     if seed:
         random.seed(seed)
 
-    # ── assemble prompt pieces ─────────────────────────────────────────
+    # ── dynamic column list ---------------------------------------------
+    extra_cols: list[tuple[str, str]] = []
+    if extra_schema.strip():
+        extra_cols = _parse_extra_schema(extra_schema)
+        if len(extra_cols) > 10:
+            raise ValueError("Max 10 extra columns allowed")
+
+    # ── build the prompt -------------------------------------------------
     prompt_parts = [
         "You are a clinical data engine that fabricates HIGH-QUALITY "
-        "synthetic patients strictly for software testing and demo.",
+        "synthetic patients strictly for software testing and demo purposes.",
         "",
         f"Diagnosis to model: **{icd_label}** (ICD-10 {icd_code}).",
         f"Number of patients requested: **{n}**.",
@@ -112,108 +151,129 @@ def generate_cohort(
         if readable:
             prompt_parts.append(f"Apply these demographic constraints: {readable}")
 
-    # ── ingest reference docs → vectordb ───────────────────────────────
+    if extra_cols:
+        want = ", ".join(f"{nm} ({tp})" for nm, tp in extra_cols)
+        prompt_parts.append(
+            f"Additionally include these extra attributes on each patient: {want}"
+        )
+
+    # ── ingest reference docs → vector db --------------------------------
     notes    = [ln.strip() for ln in comments.splitlines()]
     vectordb = ingest(files, notes) if files else None
 
     if vectordb:
-        query     = f"{icd_label} clinical features comorbidities treatment"
-        passages  = vectordb.similarity_search(query, k=6)
-        contexts  = "\n---\n".join(p.page_content.strip()[:1_400] for p in passages)
+        query = f"{icd_label} clinical features comorbidities treatment epidemiology"
+        passages = vectordb.similarity_search(query, k=6)
+        contexts = "\n---\n".join(p.page_content.strip()[:1_400] for p in passages)
         prompt_parts.append(
             "Use the following snippets ONLY for clinical realism. "
             "Never copy text verbatim:\n" + contexts
         )
 
-    # ── strict JSON instructions ───────────────────────────────────────
+    # strict JSON format string ------------------------------------------
+    core_fields = "\n".join(
+        f"- {f}" for f in PatientRow.model_fields.keys()
+    )
+    extra_fields = "\n".join(
+        f"- {nm} ({tp})" for nm, tp in extra_cols
+    )
     prompt_parts.append(
         textwrap.dedent(
-            """
+            f"""
             Respond ONLY with valid JSON – an array of objects.
-            Each object must contain:
+            Each object must contain **all** of:
 
-            - patient_id   (string, unique)
-            - age          (integer)
-            - sex          ("F" or "M")
-            - race         (US CDC wide-band)
-            - ethnicity    ("Hispanic or Latino" / "Not Hispanic or Latino")
-            - icd10_code   (string)
-            - diagnosis    (string)
-
+{core_fields}
+{extra_fields or ''}
             Return NO markdown fences, NO commentary – pure JSON.
             """
         )
     )
 
-    # ── call the LLM ───────────────────────────────────────────────────
-    msgs      = [
-        {"role": "system", "content": "You are a careful medical data generator."},
-        {"role": "user",   "content": "\n".join(prompt_parts)},
+    # ── LLM call ---------------------------------------------------------
+    msgs = [
+        {"role": "system",
+         "content": "You are a careful medical data generator."},
+        {"role": "user",
+         "content": "\n".join(prompt_parts)},
     ]
-    response  = chat(msgs)
-    raw_json  = response.choices[0].message.content.strip()
+    response = chat(msgs)
+    raw_json = response.choices[0].message.content.strip()
 
     try:
         raw_rows = json.loads(raw_json)
     except json.JSONDecodeError as err:
         raise RuntimeError(f"LLM returned invalid JSON: {err}") from None
 
-    # ── validate & coerce rows ─────────────────────────────────────────
-    rows:      list[PatientRow] = []
-    seen_ids:  set[str]         = set()
+    # ── validate & coerce core columns -----------------------------------
+    rows: list[dict] = []
+    seen_ids: set[str] = set()
 
     for idx, r in enumerate(raw_rows, 1):
+        # core validation
         try:
-            patient = PatientRow.model_validate(r)
+            core = PatientRow.model_validate(r)        # type: ignore[arg-type]
         except ValidationError as e:
-            raise RuntimeError(f"Row {idx} failed validation →\n{e}") from None
+            raise RuntimeError(f"Row {idx} failed core validation →\n{e}") from None
 
-        if patient.icd10_code != icd_code.upper():
+        if core.icd10_code != icd_code.upper():
             raise RuntimeError(
-                f"Row {idx}: icd10_code '{patient.icd10_code}' "
-                f"≠ requested '{icd_code}'"
+                f"Row {idx}: icd10_code '{core.icd10_code}' ≠ requested '{icd_code}'"
             )
-        if patient.patient_id in seen_ids:
-            raise RuntimeError(f"Duplicate patient_id '{patient.patient_id}'")
-        seen_ids.add(patient.patient_id)
-        rows.append(patient)
+        if core.patient_id in seen_ids:
+            raise RuntimeError(f"Duplicate patient_id '{core.patient_id}'")
+        seen_ids.add(core.patient_id)
+
+        # extra-column presence / type check
+        for col, typ in extra_cols:
+            if col not in r:
+                raise RuntimeError(f"Row {idx} missing extra column '{col}'")
+            if typ == "int"   and not isinstance(r[col], int):
+                raise RuntimeError(f"Row {idx} → {col} must be int")
+            if typ == "float" and not isinstance(r[col], (int, float)):
+                raise RuntimeError(f"Row {idx} → {col} must be float")
+            if typ == "str"   and not isinstance(r[col], str):
+                raise RuntimeError(f"Row {idx} → {col} must be str")
+
+        rows.append(r)       # keep original dict (includes extras)
 
     if len(rows) != n:
         raise RuntimeError(f"Model returned {len(rows)} rows, expected {n}")
 
-    # ── temp dir & CSV ─────────────────────────────────────────────────
+    # ── write CSV ---------------------------------------------------------
     tmp_dir  = Path(tempfile.mkdtemp())
     csv_path = tmp_dir / "patients.csv"
-    headers  = PatientRow.model_fields.keys()
+    headers  = list(PatientRow.model_fields.keys()) + [nm for nm, _ in extra_cols]
 
     with csv_path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        for p in rows:
-            writer.writerow([getattr(p, h) for h in headers])
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({h: r.get(h, "") for h in headers})
 
-    # ───────────────────────── step 5 ▪ meta file ──────────────────────
-    run_id   = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    meta_doc = {
-        "run_id"        : run_id,
-        "generated_utc" : datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "icd10_code"    : icd_code,
-        "icd10_label"   : icd_label,
-        "n_requested"   : n,
-        "demographics"  : demo_filters,
-        "model"         : MODEL,
-        "temperature"   : TEMPERATURE,
-        "seed"          : seed,
-        "usage_tokens"  : {
-            "prompt"     : getattr(response.usage, "prompt_tokens",     None),
-            "completion" : getattr(response.usage, "completion_tokens", None),
-            "total"      : getattr(response.usage, "total_tokens",      None),
+    # ── metadata ----------------------------------------------------------
+    run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    meta = {
+        "run_id": run_id,
+        "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "icd10_code": icd_code,
+        "icd10_label": icd_label,
+        "n_requested": n,
+        "demographics": demo_filters,
+        "model": MODEL,
+        "temperature": TEMPERATURE,
+        "seed": seed,
+        "extra_columns": {nm: tp for nm, tp in extra_cols},
+        "usage_tokens": {
+            "prompt":     getattr(response.usage, "prompt_tokens",     None),
+            "completion": getattr(response.usage, "completion_tokens", None),
+            "total":      getattr(response.usage, "total_tokens",      None),
         },
     }
     meta_path = tmp_dir / "run_meta.json"
-    json.dump(meta_doc, meta_path.open("w"), indent=2)
+    json.dump(meta, meta_path.open("w"), indent=2)
 
-    # ── ZIP bundle (CSV + meta) ────────────────────────────────────────
+    # ── bundle ZIP --------------------------------------------------------
     zip_path = tmp_dir / "cohort.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(csv_path,  csv_path.name)
