@@ -18,38 +18,40 @@ from backend.data_ingest  import ingest                       # PDF/DOC/TXT ⇒ 
 # ════════════════════════════════════════════════════════════════════════
 # 0 ▪ textarea helper  –  now supports optional unit
 # ════════════════════════════════════════════════════════════════════════
-def _parse_extra_schema(text: str) -> list[tuple[str, str, str]]:
+# ----------------------------------------------------------------------
+def _parse_extra_schema(text: str) -> list[tuple[str, str]]:
     """
-    Convert textarea lines → [(field, type, unit)].
+    Parse textarea lines into [(field_name, type), …]
 
-    Expected format per line   field_name : type : unit(optional)
-
-    • type must be int | float | str  (case-insensitive)
-    • unit is free text (can be blank)
+    • Accepts exactly one “:” per non-blank line.
+    • Allowed types → int | float | str  (case-insensitive).
+    • Ignores leading bullets (✓, *, •) and surrounding whitespace.
     """
-    out: list[tuple[str, str, str]] = []
-    for ln in text.splitlines():
-        if not ln.strip() or ln.strip().startswith("#"):
-            continue
+    cols: list[tuple[str, str]] = []
 
-        parts = [p.strip() for p in ln.split(":")]
-        if len(parts) < 2:
-            raise ValueError(f"Missing ':' → {ln!r}")
+    for raw in text.splitlines():
+        ln = raw.lstrip("•*✓- ").strip()          # strip any bullets / dashes
+        if not ln:
+            continue                              # skip blank lines
 
-        name, typ = parts[0], parts[1].lower()
-        unit      = ":".join(parts[2:]).strip() if len(parts) > 2 else ""
+        if ln.count(":") != 1:
+            raise ValueError(f"Expect one ':' → {raw!r}")
+
+        name, typ = [p.strip() for p in ln.split(":", 1)]
 
         if not name.isidentifier():
-            raise ValueError(f"Bad field name → {name!r}")
+            raise ValueError(f"Invalid field name → {name!r}")
+
+        typ = typ.lower()
         if typ not in {"int", "float", "str"}:
-            raise ValueError(f"Type must be int|float|str → {typ!r}")
+            raise ValueError(f"Type must be int / float / str → {typ!r}")
 
-        out.append((name, typ, unit))
+        cols.append((name, typ))
 
-    if not out:
+    if not cols:
         raise ValueError("No columns recognised")
-    return out
 
+    return cols          # e.g. [("fev1_pct","float"), …]
 
 # ════════════════════════════════════════════════════════════════════════
 # 1 ▪ Core patient schema  (kept tiny & fast)
