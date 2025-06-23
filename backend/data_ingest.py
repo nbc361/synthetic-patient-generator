@@ -13,8 +13,7 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
 )
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter   # <- stays the same
 
 # one global embedding model (uses OPENAI_API_KEY from env / st.secrets)
 _EMBED = OpenAIEmbeddings()
