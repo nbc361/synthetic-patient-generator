@@ -12,20 +12,38 @@ code = st.text_input("ICD-10 code (e.g. J47, L73.2, K50)")
 diagnosis = ""
 
 if code:
+    raw = code.strip().upper()          # normalise user input
     url = "https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search"
     params = {
-        "sf": "code,desc",   # return code + description
-        "df": "desc",        # search in description field too
-        "terms": code.upper()
+        "sf": "code,desc",              # fields to return
+        "df": "desc",                   # search description, too
+        "terms": raw
     }
+
     try:
         resp = requests.get(url, params=params, timeout=5)
-        data = resp.json()   # [list-length, [codes], [descs], ...]
-        if data[0] > 0 and data[1][0].upper() == code.upper():
-            diagnosis = data[2][0]          # first matching description
-            st.success(f"Diagnosis: **{diagnosis}**")
+        data = resp.json()              # ⇢ [count, [codes], [descs], …]
+
+        # Sanity-check the payload
+        if not (isinstance(data, list) and len(data) >= 3):
+            st.error("Unexpected response from ICD-10 API.")
+            st.stop()
+
+        count, codes, descs = data[:3]
+
+        # find first match whose code *starts with* what the user typed
+        match_idx = next(
+            (i for i, c in enumerate(codes) if c.upper().startswith(raw)),
+            None
+        )
+
+        if match_idx is not None:
+            full_code  = codes[match_idx]
+            diagnosis  = descs[match_idx]
+            st.success(f"Code resolved to **{full_code} — {diagnosis}**")
         else:
             st.error("ICD-10 code not found.")
+
     except Exception as e:
         st.error(f"Lookup error: {e}")
         
