@@ -1,59 +1,58 @@
 # backend/pipeline.py
-"""End-to-end synthetic-cohort generator (dynamic extra columns supported)."""
+"""End-to-end synthetic-cohort generator (dynamic columns, units, cost)."""
 
 from __future__ import annotations
 
-# ── std-lib ───────────────────────────────────────────────────────────────
-import csv, json, os, random, tempfile, textwrap, zipfile
+# ── std-lib ──────────────────────────────────────────────────────────────
+import csv, json, random, tempfile, textwrap, zipfile
 from datetime import datetime
 from pathlib import Path
 
-# ── third-party ───────────────────────────────────────────────────────────
+# ── third-party ──────────────────────────────────────────────────────────
 from pydantic import BaseModel, ValidationError, field_validator
 
-# ── local helpers ─────────────────────────────────────────────────────────
+# ── local helpers ────────────────────────────────────────────────────────
 from backend.openai_utils import chat, MAX_PATIENTS, MODEL, TEMPERATURE
 from backend.data_ingest  import ingest                       # PDF/DOC/TXT ⇒ Chroma
 
 # ════════════════════════════════════════════════════════════════════════
-# 0 ▪ small helper Streamlit calls to validate the “extra schema” box
+# 0 ▪ textarea helper  –  now supports optional unit
 # ════════════════════════════════════════════════════════════════════════
-def _parse_extra_schema(text: str) -> list[tuple[str, str]]:
+def _parse_extra_schema(text: str) -> list[tuple[str, str, str]]:
     """
-    Convert the textarea lines into [(field, type), …].
+    Convert textarea lines → [(field, type, unit)].
 
-    • Expects “field_name : type” on each non-blank line
-    • Allowed types → int | float | str (case-insensitive)
-    • Raises ValueError on any problem
+    Expected format per line   field_name : type : unit(optional)
+
+    • type must be int | float | str  (case-insensitive)
+    • unit is free text (can be blank)
     """
-    cols: list[tuple[str, str]] = []
-
+    out: list[tuple[str, str, str]] = []
     for ln in text.splitlines():
-        if not ln.strip():
-            continue                         # skip blank lines
+        if not ln.strip() or ln.strip().startswith("#"):
+            continue
 
-        if ":" not in ln:
-            raise ValueError(f"Missing ':' in line → {ln!r}")
+        parts = [p.strip() for p in ln.split(":")]
+        if len(parts) < 2:
+            raise ValueError(f"Missing ':' → {ln!r}")
 
-        name, typ = [p.strip() for p in ln.split(":", 1)]
+        name, typ = parts[0], parts[1].lower()
+        unit      = ":".join(parts[2:]).strip() if len(parts) > 2 else ""
 
         if not name.isidentifier():
-            raise ValueError(f"Invalid field name → {name!r}")
-
-        typ = typ.lower()
+            raise ValueError(f"Bad field name → {name!r}")
         if typ not in {"int", "float", "str"}:
-            raise ValueError(f"Type must be int / float / str → {typ!r}")
+            raise ValueError(f"Type must be int|float|str → {typ!r}")
 
-        cols.append((name, typ))
+        out.append((name, typ, unit))
 
-    if not cols:
+    if not out:
         raise ValueError("No columns recognised")
-
-    return cols                                # e.g. [("fev1_pct","float"), …]
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════
-# 1 ▪ Static (core) patient schema
+# 1 ▪ Core patient schema  (kept tiny & fast)
 # ════════════════════════════════════════════════════════════════════════
 class PatientRow(BaseModel):
     patient_id : str
@@ -64,7 +63,6 @@ class PatientRow(BaseModel):
     icd10_code : str
     diagnosis  : str
 
-    # basic coercions / checks -------------------------------------------
     @field_validator("age")
     @classmethod
     def _age_ok(cls, v: int) -> int:
@@ -83,62 +81,56 @@ class PatientRow(BaseModel):
     @field_validator("ethnicity")
     @classmethod
     def _eth_ok(cls, v: str) -> str:
-        allowed = {
-            "HISPANIC OR LATINO",
-            "NOT HISPANIC OR LATINO",
-        }
+        allowed = {"HISPANIC OR LATINO", "NOT HISPANIC OR LATINO"}
         if v.upper() not in allowed:
             raise ValueError("ethnicity must follow CDC wording")
         return v.title()
 
     @field_validator("icd10_code", mode="before")
     @classmethod
-    def _code_upper(cls, v: str) -> str:
+    def _upper(cls, v: str) -> str:
         return v.upper().strip()
 
 
 # ════════════════════════════════════════════════════════════════════════
-# 2 ▪ Public entry-point consumed by Streamlit front-end
+# 2 ▪ Public API  (called by Streamlit front-end)
 # ════════════════════════════════════════════════════════════════════════
 def generate_cohort(
     *,
     icd_code:      str,
     icd_label:     str,
-    files,                          # list[streamlit.UploadedFile]
+    files,
     comments:      str,
     n:             int,
     demo_filters:  dict,
     seed:          str | None = None,
     benchmark                   = None,
-    extra_schema:   str          = "",   # << NEW
+    extra_schema:   str         = "",
 ):
-    """
-    Returns (zip_path, run_id).
+    """Return (zip_path, run_id)."""
 
-    • Index PDFs/DOCX/TXT ⇒ Chroma, pull top passages to seed the LLM
-    • Generates core columns + caller-defined extra columns (<=10)
-    • Validates rows with Pydantic, writes CSV + run_meta.json inside ZIP
-    """
-
-    # ── guard rails ------------------------------------------------------
+    # ── guard rails ────────────────────────────────────────────────────
     if n > MAX_PATIENTS:
-        raise ValueError(f"n={n} exceeds MAX_PATIENTS={MAX_PATIENTS}")
+        raise ValueError(f"n={n} > MAX_PATIENTS={MAX_PATIENTS}")
     if not (icd_code and icd_label):
         raise ValueError("ICD-10 code/label missing")
     if seed:
         random.seed(seed)
 
-    # ── dynamic column list ---------------------------------------------
-    extra_cols: list[tuple[str, str]] = []
+    # ── dynamic columns -------------------------------------------------
+    extra_cols: list[tuple[str, str, str]] = []
     if extra_schema.strip():
         extra_cols = _parse_extra_schema(extra_schema)
         if len(extra_cols) > 10:
-            raise ValueError("Max 10 extra columns allowed")
+            raise ValueError("Max 10 extra columns")
 
-    # ── build the prompt -------------------------------------------------
+    # ── prompt assembly ────────────────────────────────────────────────
     prompt_parts = [
-        "You are a clinical data engine that fabricates HIGH-QUALITY "
-        "synthetic patients strictly for software testing and demo purposes.",
+        "You are a clinical data engine that fabricates HIGH-QUALITY synthetic "
+        "patients strictly for software testing and demo. Follow ALL rules:",
+        "— Do NOT invent lab tests or units that do not exist.",
+        "— Use realistic human ranges (e.g. weight 40-200 kg; FEV1 10-110 %).",
+        "— NEVER copy text verbatim from reference passages.",
         "",
         f"Diagnosis to model: **{icd_label}** (ICD-10 {icd_code}).",
         f"Number of patients requested: **{n}**.",
@@ -152,131 +144,127 @@ def generate_cohort(
             prompt_parts.append(f"Apply these demographic constraints: {readable}")
 
     if extra_cols:
-        want = ", ".join(f"{nm} ({tp})" for nm, tp in extra_cols)
         prompt_parts.append(
-            f"Additionally include these extra attributes on each patient: {want}"
+            "Additionally include these attributes:"
+            + ", ".join(f"{nm} ({tp})" for nm, tp, _ in extra_cols)
         )
 
-    # ── ingest reference docs → vector db --------------------------------
+    # ── context from reference documents --------------------------------
     notes    = [ln.strip() for ln in comments.splitlines()]
     vectordb = ingest(files, notes) if files else None
-
     if vectordb:
-        query = f"{icd_label} clinical features comorbidities treatment epidemiology"
-        passages = vectordb.similarity_search(query, k=6)
-        contexts = "\n---\n".join(p.page_content.strip()[:1_400] for p in passages)
+        q   = f"{icd_label} clinical features comorbidities treatment"
+        ctx = vectordb.similarity_search(q, k=6)
+        snippet = "\n---\n".join(d.page_content.strip()[:1_400] for d in ctx)
         prompt_parts.append(
-            "Use the following snippets ONLY for clinical realism. "
-            "Never copy text verbatim:\n" + contexts
+            "Use the following snippets ONLY for realism; never copy:\n" + snippet
         )
 
-    # strict JSON format string ------------------------------------------
-    core_fields = "\n".join(
-        f"- {f}" for f in PatientRow.model_fields.keys()
-    )
-    extra_fields = "\n".join(
-        f"- {nm} ({tp})" for nm, tp in extra_cols
-    )
+    # strict JSON instruction -------------------------------------------
+    core_fields   = "\n".join(f"- {f}" for f in PatientRow.model_fields.keys())
+    extra_fields  = "\n".join(f"- {nm} ({tp})" for nm, tp, _ in extra_cols)
     prompt_parts.append(
         textwrap.dedent(
             f"""
             Respond ONLY with valid JSON – an array of objects.
-            Each object must contain **all** of:
+            Each object must contain:
 
 {core_fields}
 {extra_fields or ''}
-            Return NO markdown fences, NO commentary – pure JSON.
+
+            NO markdown fences, NO commentary – pure JSON only.
             """
         )
     )
 
-    # ── LLM call ---------------------------------------------------------
-    msgs = [
-        {"role": "system",
-         "content": "You are a careful medical data generator."},
-        {"role": "user",
-         "content": "\n".join(prompt_parts)},
+    # ── call OpenAI ─────────────────────────────────────────────────────
+    msgs      = [
+        {"role": "system", "content": "You are a careful medical data generator."},
+        {"role": "user",   "content": "\n".join(prompt_parts)},
     ]
-    response = chat(msgs)
-    raw_json = response.choices[0].message.content.strip()
+    response  = chat(msgs)                 # openai_utils adds _cost_usd
+    raw_json  = response.choices[0].message.content.strip()
 
     try:
         raw_rows = json.loads(raw_json)
-    except json.JSONDecodeError as err:
-        raise RuntimeError(f"LLM returned invalid JSON: {err}") from None
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"LLM returned invalid JSON → {e}") from None
 
-    # ── validate & coerce core columns -----------------------------------
+    # ── validate rows ---------------------------------------------------
     rows: list[dict] = []
     seen_ids: set[str] = set()
 
     for idx, r in enumerate(raw_rows, 1):
-        # core validation
+
+        # core checks
         try:
-            core = PatientRow.model_validate(r)        # type: ignore[arg-type]
+            core = PatientRow.model_validate(r)               # type: ignore[arg-type]
         except ValidationError as e:
-            raise RuntimeError(f"Row {idx} failed core validation →\n{e}") from None
+            raise RuntimeError(f"Row {idx} core validation failed →\n{e}") from None
 
         if core.icd10_code != icd_code.upper():
-            raise RuntimeError(
-                f"Row {idx}: icd10_code '{core.icd10_code}' ≠ requested '{icd_code}'"
-            )
+            raise RuntimeError(f"Row {idx}: icd10_code mismatch")
         if core.patient_id in seen_ids:
             raise RuntimeError(f"Duplicate patient_id '{core.patient_id}'")
         seen_ids.add(core.patient_id)
 
-        # extra-column presence / type check
-        for col, typ in extra_cols:
+        # extra cols checks
+        for col, typ, _unit in extra_cols:
             if col not in r:
-                raise RuntimeError(f"Row {idx} missing extra column '{col}'")
+                raise RuntimeError(f"Row {idx} missing '{col}'")
             if typ == "int"   and not isinstance(r[col], int):
-                raise RuntimeError(f"Row {idx} → {col} must be int")
+                raise RuntimeError(f"{col} must be int  (row {idx})")
             if typ == "float" and not isinstance(r[col], (int, float)):
-                raise RuntimeError(f"Row {idx} → {col} must be float")
+                raise RuntimeError(f"{col} must be float  (row {idx})")
             if typ == "str"   and not isinstance(r[col], str):
-                raise RuntimeError(f"Row {idx} → {col} must be str")
+                raise RuntimeError(f"{col} must be str  (row {idx})")
 
-        rows.append(r)       # keep original dict (includes extras)
+        rows.append(r)
 
     if len(rows) != n:
         raise RuntimeError(f"Model returned {len(rows)} rows, expected {n}")
 
-    # ── write CSV ---------------------------------------------------------
+    # ── CSV output ------------------------------------------------------
     tmp_dir  = Path(tempfile.mkdtemp())
     csv_path = tmp_dir / "patients.csv"
-    headers  = list(PatientRow.model_fields.keys()) + [nm for nm, _ in extra_cols]
+    headers  = list(PatientRow.model_fields.keys()) + [nm for nm, _, _ in extra_cols]
 
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
+    with csv_path.open("w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=headers)
+        wr.writeheader()
         for r in rows:
-            writer.writerow({h: r.get(h, "") for h in headers})
+            wr.writerow({h: r.get(h, "") for h in headers})
 
-    # ── metadata ----------------------------------------------------------
+    # ── meta JSON -------------------------------------------------------
     run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    meta = {
-        "run_id": run_id,
-        "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "icd10_code": icd_code,
-        "icd10_label": icd_label,
-        "n_requested": n,
-        "demographics": demo_filters,
-        "model": MODEL,
-        "temperature": TEMPERATURE,
-        "seed": seed,
-        "extra_columns": {nm: tp for nm, tp in extra_cols},
-        "usage_tokens": {
-            "prompt":     getattr(response.usage, "prompt_tokens",     None),
-            "completion": getattr(response.usage, "completion_tokens", None),
-            "total":      getattr(response.usage, "total_tokens",      None),
-        },
-    }
     meta_path = tmp_dir / "run_meta.json"
-    json.dump(meta, meta_path.open("w"), indent=2)
+    json.dump(
+        {
+            "run_id"          : run_id,
+            "generated_utc"   : datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "icd10_code"      : icd_code,
+            "icd10_label"     : icd_label,
+            "n_requested"     : n,
+            "demographics"    : demo_filters,
+            "model"           : MODEL,
+            "temperature"     : TEMPERATURE,
+            "seed"            : seed,
+            "extra_units"     : {nm: unit for nm, _, unit in extra_cols},
+            "usage_tokens"    : {
+                "prompt"     : getattr(response.usage, "prompt_tokens",     None),
+                "completion" : getattr(response.usage, "completion_tokens", None),
+                "total"      : getattr(response.usage, "total_tokens",      None),
+            },
+            "estimated_cost_usd": getattr(response, "_cost_usd", None),
+        },
+        meta_path.open("w"),
+        indent=2,
+    )
 
-    # ── bundle ZIP --------------------------------------------------------
+    # ── ZIP bundle ------------------------------------------------------
     zip_path = tmp_dir / "cohort.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(csv_path,  csv_path.name)
-        z.write(meta_path, meta_path.name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(csv_path,  csv_path.name)
+        zf.write(meta_path, meta_path.name)
 
     return zip_path, run_id
