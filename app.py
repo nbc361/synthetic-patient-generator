@@ -79,9 +79,7 @@ with st.expander("Optional extra patient attributes"):
 *(≈ 10 columns max is a good rule of thumb.)*
 
 **Example**
-fev1_pct : float
-sputum_volume_ml : int
-smoking_status : str
+fev1_pct : float ; sputum_volume_ml : int ; smoking_status : str
 """
     )
 
