@@ -2,8 +2,8 @@
 streamlit==1.34
 openai>=1.30
 langchain==0.3.25           # orchestrator
-langchain-community>=0.3.25 # loaders & vector-DB bridges
-langchain-openai>=0.1.8     # OpenAI embeddings / chat interface
+langchain-community>=0.0.30        # document loaders, text splitters, etc.
+langchain-openai>=0.0.6            # OpenAIEmbeddings, ChatOpenAI, …
 chromadb==1.0.12            # in-memory vector store
 tiktoken>=0.6               # token counting
 pydantic>=2.7
